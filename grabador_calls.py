@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
+r"""
 Graba solo las calls de Teams (el audio de la call + el microfono), sin OBS.
 
     pythonw grabador_calls.py
@@ -113,7 +113,6 @@ def sesiones_de_teams():
     dice QUE dispositivos usa la call, que no siempre son los predeterminados."""
     import comtypes
     import psutil
-    from ctypes import POINTER, cast
     from pycaw.pycaw import AudioUtilities, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator
     from pycaw.constants import CLSID_MMDeviceEnumerator
 
@@ -124,8 +123,10 @@ def sesiones_de_teams():
         col = enum.EnumAudioEndpoints(flujo, 1)  # DEVICE_STATE_ACTIVE
         for i in range(col.GetCount()):
             disp = col.Item(i)
-            mgr = cast(disp.Activate(IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None),
-                       POINTER(IAudioSessionManager2))
+            # QueryInterface y no cast(): cast no suma referencia y comtypes la
+            # libera igual al recolectar -> a las ~100 vueltas, acceso invalido
+            mgr = disp.Activate(IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None
+                                ).QueryInterface(IAudioSessionManager2)
             sesiones = mgr.GetSessionEnumerator()
             for j in range(sesiones.GetCount()):
                 ctl = sesiones.GetSession(j).QueryInterface(IAudioSessionControl2)
@@ -452,7 +453,22 @@ class App:
         self.cortar()  # el hilo de ffmpeg no es daemon: termina de mezclar antes de morir
         self.icon.stop()
 
+    def rescatar(self):
+        """Si el proceso murio grabando, los WAV quedaron en .en-curso: se
+        mezclan al arrancar, como si la grabacion hubiera terminado bien."""
+        for mic in sorted(EN_CURSO.glob("* mic.wav")) if EN_CURSO.exists() else []:
+            base = mic.name[:-len(" mic.wav")]
+            if not (EN_CURSO / f"{base} call.wav").exists():
+                continue
+            g = Grabacion.__new__(Grabacion)
+            g.base, g.wav_mic, g.wav_call = base, mic, EN_CURSO / f"{base} call.wav"
+            log.info("rescatando %s", base)
+            if mp3 := g.finalizar():
+                self.ultima = mp3
+
     def correr(self):
+        threading.excepthook = lambda a: log.error("hilo %s", a.thread, exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+        threading.Thread(target=self.rescatar, daemon=False).start()
         threading.Thread(target=self.vigilar, daemon=True).start()
         self.icon.run(setup=lambda icon: setattr(icon, "visible", True))
 
