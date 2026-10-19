@@ -30,6 +30,7 @@ TRANSCRIBIR (opcional): si la variable de entorno WHISPERX340_DIR apunta a un
 proyecto de WhisperX340, el menu ofrece "Transcribir la ultima".
 """
 import ctypes
+import functools
 import logging
 import os
 import shutil
@@ -59,6 +60,9 @@ CADA = 2.0           # segundos entre lecturas
 ARRANCAR_TRAS = 3.0  # el microfono tiene que seguir abierto este tiempo
 CORTAR_TRAS = 15.0   # y cerrado este otro, para no partir una call en dos
 HUECO = 0.10         # un atraso mayor a esto en una pista se rellena con silencio
+SILENCIO_CORTE = 600 # con las dos pistas mudas este tiempo, la call termino aunque Teams no suelte el mic
+UMBRAL = 184         # pico de -45 dBFS en int16: por debajo es silencio
+PICO_TEAMS = 0.01    # medidor de la sesion de Teams (0..1): por encima, Teams esta sonando
 
 MIC_REG = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
 TEAMS_NUEVO = "MSTeams_8wekyb3d8bbwe"
@@ -70,6 +74,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 try:
+    import numpy as np
     import pyaudiowpatch as pa
     from PIL import Image, ImageDraw
     from pystray import Icon, Menu, MenuItem
@@ -106,19 +111,24 @@ def claves_de_teams():
 
 
 def sesiones_de_teams():
-    """(microfono, salida) que Teams tiene abiertos ahora, o None si no captura.
+    """(microfono, salida, pico) de Teams ahora, o None si no captura.
+
+    pico es lo maximo que marca el medidor de las sesiones de salida de Teams:
+    si suena algo por Teams, hay call aunque el microfono ya estuviera abierto.
 
     Es la deteccion principal: con un microfono virtual en el medio (NVIDIA
     Broadcast, por ejemplo) el registro no se entera de Teams, y ademas esto
     dice QUE dispositivos usa la call, que no siempre son los predeterminados."""
     import comtypes
     import psutil
-    from pycaw.pycaw import AudioUtilities, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator
+    from pycaw.pycaw import (AudioUtilities, IAudioMeterInformation, IAudioSessionControl2,
+                             IAudioSessionManager2, IMMDeviceEnumerator)
     from pycaw.constants import CLSID_MMDeviceEnumerator
 
     enum = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator,
                                      comtypes.CLSCTX_INPROC_SERVER)
     encontrados = {}
+    pico = 0.0
     for flujo in (0, 1):  # eRender, eCapture
         col = enum.EnumAudioEndpoints(flujo, 1)  # DEVICE_STATE_ACTIVE
         for i in range(col.GetCount()):
@@ -129,7 +139,8 @@ def sesiones_de_teams():
                                 ).QueryInterface(IAudioSessionManager2)
             sesiones = mgr.GetSessionEnumerator()
             for j in range(sesiones.GetCount()):
-                ctl = sesiones.GetSession(j).QueryInterface(IAudioSessionControl2)
+                sesion = sesiones.GetSession(j)
+                ctl = sesion.QueryInterface(IAudioSessionControl2)
                 if ctl.GetState() != 1:  # AudioSessionStateActive
                     continue
                 try:
@@ -138,9 +149,11 @@ def sesiones_de_teams():
                     continue
                 if "teams" in nombre:
                     encontrados.setdefault(flujo, AudioUtilities.CreateDevice(disp).FriendlyName)
+                    if flujo == 0:
+                        pico = max(pico, sesion.QueryInterface(IAudioMeterInformation).GetPeakValue())
     if 1 not in encontrados:
         return None
-    return encontrados[1], encontrados.get(0)
+    return encontrados[1], encontrados.get(0), pico
 
 
 def teams_usa_el_microfono():
@@ -168,6 +181,7 @@ class Pista:
         self.bytes_frame = 2 * self.canales
         self.t0 = t0
         self.escritos = 0
+        self.ultimo_sonido = t0
         self.lock = threading.Lock()
         self.wav = wave.open(str(ruta), "wb")
         self.wav.setnchannels(self.canales)
@@ -191,6 +205,9 @@ class Pista:
             self._rellenar_hasta(int((time.monotonic() - self.t0) * self.tasa) - n)
             self.wav.writeframes(datos)
             self.escritos += n
+        muestras = np.frombuffer(datos, dtype=np.int16)
+        if muestras.size and max(int(muestras.max()), -int(muestras.min())) > UMBRAL:
+            self.ultimo_sonido = time.monotonic()
         return (None, pa.paContinue)
 
     def cerrar(self):
@@ -229,7 +246,8 @@ class Grabacion:
         self.audio = pa.PyAudio()
         self.wav_mic = EN_CURSO / f"{self.base} mic.wav"
         self.wav_call = EN_CURSO / f"{self.base} call.wav"
-        t0 = time.monotonic()
+        t0 = self.t0 = time.monotonic()
+        self.recorte = None  # segundos a conservar; None = todo
         self.pistas = []
         try:
             self.pistas.append(Pista(self.audio, buscar(self.audio, MICROFONO or mic, False), self.wav_mic, t0))
@@ -241,8 +259,12 @@ class Grabacion:
             raise
         log.info("grabando %s | mic=%s | call=%s", self.base, *[p.nombre for p in self.pistas])
 
+    def ultimo_sonido(self):
+        return max(p.ultimo_sonido for p in self.pistas)
+
     def duracion(self):
-        s = int(time.monotonic() - self.inicio)
+        recorte = getattr(self, "recorte", None)
+        s = int(recorte if recorte is not None else time.monotonic() - self.inicio)
         return f"{s // 60}:{s % 60:02d}"
 
     def detener(self):
@@ -256,14 +278,15 @@ class Grabacion:
         Si ffmpeg falla, los WAV quedan en .en-curso para no perder nada."""
         mp3 = CARPETA / f"{self.base}.mp3"
         PISTAS.mkdir(parents=True, exist_ok=True)
+        corte = ["-t", f"{self.recorte:.1f}"] if getattr(self, "recorte", None) else []
         mezcla = ("[0:a]aformat=channel_layouts=mono[a];[1:a]aformat=channel_layouts=mono[b];"
                   "[a][b]amix=inputs=2:duration=longest:normalize=0[m]")
         cmds = [
             ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.wav_mic), "-i", str(self.wav_call),
-             "-filter_complex", mezcla, "-map", "[m]", "-c:a", "libmp3lame", "-b:a", "96k", str(mp3)],
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.wav_mic),
+             "-filter_complex", mezcla, "-map", "[m]", "-c:a", "libmp3lame", "-b:a", "96k", *corte, str(mp3)],
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.wav_mic), *corte,
              str(PISTAS / f"{self.base} mic.flac")],
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.wav_call),
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(self.wav_call), *corte,
              str(PISTAS / f"{self.base} call.flac")],
         ]
         for cmd in cmds:
@@ -280,6 +303,7 @@ class Grabacion:
 
 # ── icono ────────────────────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=None)
 def dibujar_icono(color, lado=64):
     """Un microfono sobre un cuadrado oscuro y el punto de estado abajo a la
     derecha. Se dibuja a 256 y se achica: a 16x16 sin eso sale serruchado."""
@@ -320,6 +344,7 @@ class App:
         self.detectar = True
         self.ultima = None
         self.vivo = True
+        self.dormido = False  # se corto por silencio y Teams sigue con el mic: no rearrancar
         self.icon = Icon("grabador_calls", dibujar_icono(GRIS), f"Grabador de calls\n{FIRMA}", self._menu())
 
     def _menu(self):
@@ -341,11 +366,15 @@ class App:
     def estado(self):
         if self.grabacion:
             return f"● Grabando {self.grabacion.duracion()}" + (" (manual)" if self.manual else "")
-        return "Esperando una call" if self.detectar else "Detección pausada"
+        if not self.detectar:
+            return "Detección pausada"
+        return "Esperando que Teams suelte el micrófono" if self.dormido else "Esperando una call"
 
     def refrescar(self):
         color = ROJO if self.grabacion else (GRIS if self.detectar else AMBAR)
-        self.icon.icon = dibujar_icono(color)
+        if color != getattr(self, "_color", None):
+            self._color = color
+            self.icon.icon = dibujar_icono(color)
         self.icon.title = f"Grabador de calls — {self.estado()}\n{FIRMA}"
         self.icon.update_menu()
 
@@ -365,11 +394,15 @@ class App:
         self.refrescar()
         self.icon.notify("Grabando la call (audio + micrófono)", "Grabador de calls")
 
-    def cortar(self):
+    def cortar(self, por_silencio=False):
         with self.lock:
             g, self.grabacion, self.manual = self.grabacion, None, False
         if not g:
             return
+        if por_silencio:
+            # el silencio del final no sirve: se conserva hasta el ultimo sonido + 5 s
+            g.recorte = g.ultimo_sonido() - g.t0 + 5
+            log.info("corte por silencio: %d min sin sonido", SILENCIO_CORTE // 60)
         g.detener()
         self.refrescar()
         threading.Thread(target=self._finalizar, args=(g,), daemon=False).start()
@@ -401,11 +434,22 @@ class App:
                     if dispositivos or teams_usa_el_microfono():
                         libre_desde = None
                         en_uso_desde = en_uso_desde or ahora
-                        if not self.grabacion and ahora - en_uso_desde >= ARRANCAR_TRAS:
-                            self.arrancar(False, *(dispositivos or ()))
+                        mic, salida, pico = dispositivos or (None, None, 0.0)
+                        if self.dormido and pico > PICO_TEAMS:
+                            log.info("Teams vuelve a sonar: se rearma")
+                            self.dormido = False
+                            en_uso_desde = ahora - ARRANCAR_TRAS
+                        g = self.grabacion
+                        if g and not self.manual and ahora - g.ultimo_sonido() >= SILENCIO_CORTE:
+                            # Teams puede quedarse con el microfono horas despues de la call
+                            self.cortar(por_silencio=True)
+                            self.dormido = True
+                        elif not g and not self.dormido and ahora - en_uso_desde >= ARRANCAR_TRAS:
+                            self.arrancar(False, mic, salida)
                     else:
                         en_uso_desde = None
                         libre_desde = libre_desde or ahora
+                        self.dormido = False
                         if self.grabacion and not self.manual and ahora - libre_desde >= CORTAR_TRAS:
                             self.cortar()
                 if self.grabacion:

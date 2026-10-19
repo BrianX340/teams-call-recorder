@@ -4,3 +4,4 @@ psutil
 comtypes
 pystray
 pillow
+numpy
