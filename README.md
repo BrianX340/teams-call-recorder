@@ -19,6 +19,11 @@ para separar quién dijo qué al transcribir.
   de Teams está capturando de un micrófono, hay call. Arranca a los 3 s y corta
   15 s después de que Teams suelta el micrófono. El mute de Teams no corta la
   grabación.
+- **Teams no siempre suelta el micrófono al colgar** (puede quedarse horas con
+  él abierto). Por eso, si pasan **5 minutos sin audio del otro lado**, la call
+  se da por terminada: se guarda hasta 30 s después del último audio de la call
+  y lo grabado después se descarta. Se vuelve a armar cuando Teams suelta el
+  micrófono o cuando vuelve a sonar algo por Teams (otra call).
 - **Dispositivos:** graba los mismos que usa Teams (sirve con micrófonos
   virtuales como NVIDIA Broadcast), no los predeterminados de Windows.
 - **Audio de la call:** WASAPI loopback de la salida que usa Teams. Como el
@@ -69,6 +74,8 @@ mp3, con separación de hablantes.
   detecta: usá "Grabar ahora".
 - Si cambiás de auriculares en medio de la call, la pista de la call sigue en
   el dispositivo anterior.
+- Si en una call hablás solo vos más de 5 minutos seguidos (los demás
+  callados), se corta: lo que digas después de esos 5 minutos se pierde.
 - Teams no avisa a los demás de esta grabación. Avisá vos que estás grabando.
 
 ---

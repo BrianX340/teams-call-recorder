@@ -60,7 +60,8 @@ CADA = 2.0           # segundos entre lecturas
 ARRANCAR_TRAS = 3.0  # el microfono tiene que seguir abierto este tiempo
 CORTAR_TRAS = 15.0   # y cerrado este otro, para no partir una call en dos
 HUECO = 0.10         # un atraso mayor a esto en una pista se rellena con silencio
-SILENCIO_CORTE = 600 # con las dos pistas mudas este tiempo, la call termino aunque Teams no suelte el mic
+SILENCIO_CORTE = 300 # sin audio de la call este tiempo, la call termino aunque Teams no suelte el mic
+COLA = 30            # al cortar por silencio se conserva hasta el ultimo audio de la call + esto
 UMBRAL = 184         # pico de -45 dBFS en int16: por debajo es silencio
 PICO_TEAMS = 0.01    # medidor de la sesion de Teams (0..1): por encima, Teams esta sonando
 
@@ -154,6 +155,28 @@ def sesiones_de_teams():
     if 1 not in encontrados:
         return None
     return encontrados[1], encontrados.get(0), pico
+
+
+def ventanas_de_teams():
+    """Titulos de las ventanas visibles de Teams (solo para el log)."""
+    import psutil
+
+    pids = {p.pid for p in psutil.process_iter(["name"]) if "teams" in (p.info["name"] or "").lower()}
+    titulos = []
+    user32 = ctypes.windll.user32
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def cada(hwnd, _):
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids and user32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(256)
+            if user32.GetWindowTextW(hwnd, buf, 256):
+                titulos.append(buf.value)
+        return True
+
+    user32.EnumWindows(cada, None)
+    return titulos
 
 
 def teams_usa_el_microfono():
@@ -259,8 +282,11 @@ class Grabacion:
             raise
         log.info("grabando %s | mic=%s | call=%s", self.base, *[p.nombre for p in self.pistas])
 
-    def ultimo_sonido(self):
-        return max(p.ultimo_sonido for p in self.pistas)
+    def ultimo_sonido_call(self):
+        """Lo ultimo que sono del otro lado. El microfono no cuenta: cuando la
+        call termina y Teams no lo suelta, sigue grabando lo que pase en la
+        habitacion, y eso no prueba que haya call."""
+        return self.pistas[1].ultimo_sonido
 
     def duracion(self):
         recorte = getattr(self, "recorte", None)
@@ -400,9 +426,9 @@ class App:
         if not g:
             return
         if por_silencio:
-            # el silencio del final no sirve: se conserva hasta el ultimo sonido + 5 s
-            g.recorte = g.ultimo_sonido() - g.t0 + 5
-            log.info("corte por silencio: %d min sin sonido", SILENCIO_CORTE // 60)
+            # lo de despues del ultimo audio de la call no es la call: se descarta
+            g.recorte = g.ultimo_sonido_call() - g.t0 + COLA
+            log.info("corte por silencio: %d min sin audio de la call", SILENCIO_CORTE // 60)
         g.detener()
         self.refrescar()
         threading.Thread(target=self._finalizar, args=(g,), daemon=False).start()
@@ -422,6 +448,7 @@ class App:
         import comtypes
         comtypes.CoInitialize()  # COM es por hilo
         en_uso_desde = libre_desde = None
+        diagnostico = 0.0
         while self.vivo:
             try:
                 if self.detectar:
@@ -440,7 +467,12 @@ class App:
                             self.dormido = False
                             en_uso_desde = ahora - ARRANCAR_TRAS
                         g = self.grabacion
-                        if g and not self.manual and ahora - g.ultimo_sonido() >= SILENCIO_CORTE:
+                        if g and ahora - diagnostico >= 60:
+                            # para afinar la deteccion: que muestra Teams durante y despues de una call
+                            diagnostico = ahora
+                            log.info("diag | pico teams %.3f | call muda hace %ds | ventanas %s",
+                                     pico, ahora - g.ultimo_sonido_call(), ventanas_de_teams())
+                        if g and not self.manual and ahora - g.ultimo_sonido_call() >= SILENCIO_CORTE:
                             # Teams puede quedarse con el microfono horas despues de la call
                             self.cortar(por_silencio=True)
                             self.dormido = True
