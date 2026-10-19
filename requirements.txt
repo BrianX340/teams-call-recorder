@@ -1,0 +1,6 @@
+pyaudiowpatch
+pycaw
+psutil
+comtypes
+pystray
+pillow
