@@ -20,7 +20,10 @@ para separar quién dijo qué al transcribir.
   15 s después de que Teams suelta el micrófono. El mute de Teams no corta la
   grabación.
 - **Teams no siempre suelta el micrófono al colgar** (puede quedarse horas con
-  él abierto). Por eso, si pasan **5 minutos sin audio del otro lado**, la call
+  él abierto). Lo que sí hace es cerrar la ventana de la reunión: si la
+  grabación tuvo una ventana de reunión de Teams y esa ventana se cierra, se
+  corta en el momento, y se vuelve a armar cuando se abre otra. Como respaldo
+  (calls sin ventana propia), si pasan **5 minutos sin audio del otro lado**, la call
   se da por terminada: se guarda hasta 30 s después del último audio de la call
   y lo grabado después se descarta. Se vuelve a armar cuando Teams suelta el
   micrófono o cuando vuelve a sonar algo por Teams (otra call).

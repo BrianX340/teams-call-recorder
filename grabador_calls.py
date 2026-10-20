@@ -64,6 +64,9 @@ SILENCIO_CORTE = 300 # sin audio de la call este tiempo, la call termino aunque 
 COLA = 30            # al cortar por silencio se conserva hasta el ultimo audio de la call + esto
 UMBRAL = 184         # pico de -45 dBFS en int16: por debajo es silencio
 PICO_TEAMS = 0.01    # medidor de la sesion de Teams (0..1): por encima, Teams esta sonando
+# vistas de la ventana principal de Teams; cualquier otra ventana es la de una reunion
+VISTAS = {"microsoft teams", "calendar", "calendario", "chat", "activity", "actividad", "teams",
+          "equipos", "calls", "llamadas", "files", "archivos", "onedrive", "apps", "aplicaciones"}
 
 MIC_REG = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
 TEAMS_NUEVO = "MSTeams_8wekyb3d8bbwe"
@@ -177,6 +180,12 @@ def ventanas_de_teams():
 
     user32.EnumWindows(cada, None)
     return titulos
+
+
+def ventanas_de_reunion():
+    """Las ventanas de Teams que no son la principal: la de la reunion o la call.
+    Cuando la call termina, Teams la cierra aunque se quede con el microfono."""
+    return {t for t in ventanas_de_teams() if t.split(" | ")[0].strip().lower() not in VISTAS}
 
 
 def teams_usa_el_microfono():
@@ -370,7 +379,8 @@ class App:
         self.detectar = True
         self.ultima = None
         self.vivo = True
-        self.dormido = False  # se corto por silencio y Teams sigue con el mic: no rearrancar
+        self.dormido = False  # se corto y Teams sigue con el mic: no rearrancar
+        self.dormido_por_ventana = False  # la call cerro su ventana: rearma la proxima ventana, no el sonido
         self.icon = Icon("grabador_calls", dibujar_icono(GRIS), f"Grabador de calls\n{FIRMA}", self._menu())
 
     def _menu(self):
@@ -449,6 +459,7 @@ class App:
         comtypes.CoInitialize()  # COM es por hilo
         en_uso_desde = libre_desde = None
         diagnostico = 0.0
+        reunion_vista = False  # la grabacion en curso tuvo ventana de reunion
         while self.vivo:
             try:
                 if self.detectar:
@@ -462,11 +473,23 @@ class App:
                         libre_desde = None
                         en_uso_desde = en_uso_desde or ahora
                         mic, salida, pico = dispositivos or (None, None, 0.0)
-                        if self.dormido and pico > PICO_TEAMS:
-                            log.info("Teams vuelve a sonar: se rearma")
-                            self.dormido = False
+                        reuniones = ventanas_de_reunion()
+                        if self.dormido and (reuniones if self.dormido_por_ventana else pico > PICO_TEAMS):
+                            log.info("nueva call: se rearma | %s", sorted(reuniones))
+                            self.dormido = self.dormido_por_ventana = False
                             en_uso_desde = ahora - ARRANCAR_TRAS
                         g = self.grabacion
+                        if not g:
+                            reunion_vista = False
+                        elif reuniones:
+                            reunion_vista = True
+                        elif reunion_vista and not self.manual:
+                            # la ventana de la reunion se cerro: la call termino
+                            log.info("la ventana de la reunion se cerro")
+                            self.cortar()
+                            self.dormido = self.dormido_por_ventana = True
+                            reunion_vista = False
+                            g = None
                         if g and ahora - diagnostico >= 60:
                             # para afinar la deteccion: que muestra Teams durante y despues de una call
                             diagnostico = ahora
@@ -481,7 +504,7 @@ class App:
                     else:
                         en_uso_desde = None
                         libre_desde = libre_desde or ahora
-                        self.dormido = False
+                        self.dormido = self.dormido_por_ventana = False
                         if self.grabacion and not self.manual and ahora - libre_desde >= CORTAR_TRAS:
                             self.cortar()
                 if self.grabacion:
